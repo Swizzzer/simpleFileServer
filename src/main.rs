@@ -32,7 +32,7 @@ mod templates;
 
 const CACHE_FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024; // 缓存文件大小限制4MB
 const CACHE_FILE_NUM_LIMIT: u64 = 128; // 最多缓存128个文件
-const RATE_LIMIT_BYTES_PER_SEC: usize = 10 * 1024 * 1024; // 限速10MB/s
+const RATE_LIMIT_BYTES_PER_SEC: usize = 100 * 1024 * 1024; // 限速100MB/s
 const STREAM_BUFFER_SIZE: usize = 512 * 1024; // 增大默认的Stream capacity, 减少异步任务调度数
 
 #[derive(Parser)]
