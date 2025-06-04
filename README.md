@@ -13,3 +13,6 @@
 
 - `cargo run -- --bind 0.0.0.0 --port 3000 /path/to/files`
 - `[compiled_exec_file] --bind 127.0.0.1 --port 3000 /path/to/files`
+
+## TODO
+- [ ] 更美观的前端页面
