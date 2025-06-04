@@ -1,15 +1,15 @@
 use crate::FileEntry;
 
 pub fn generate_html(entries: &[FileEntry], current_path: &str) -> String {
-   let entries_json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
-   let current_path_display = if current_path.is_empty() {
-       "/"
-   } else {
-       current_path
-   };
+    let entries_json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
+    let current_path_display = if current_path.is_empty() {
+        "/"
+    } else {
+        current_path
+    };
 
-   format!(
-       r#"<!DOCTYPE html>
+    format!(
+        r#"<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
    <meta charset="UTF-8">
@@ -436,6 +436,6 @@ pub fn generate_html(entries: &[FileEntry], current_path: &str) -> String {
    </script>
 </body>
 </html>"#,
-       current_path_display, entries_json, current_path
-   )
+        current_path_display, entries_json, current_path
+    )
 }
