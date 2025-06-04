@@ -167,8 +167,8 @@ async fn handle_path_internal(
 async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, StatusCode> {
     let file_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
-    // 小文件缓存
     match file_size <= CACHE_FILE_SIZE_LIMIT && file_size > 0 {
+        // 小文件缓存
         true => {
             // 缓存命中
             if let Some(data) = state.file_cache.get(&file_path).await {
@@ -190,6 +190,7 @@ async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, St
             Ok(small_file_response(&file_path, arc_data, file_size))
         }
         false => {
+            // 大文件流式传输
             info!("Serving large file: {}", file_path.display());
             let file = File::open(&file_path).await.map_err(|e| {
                 error!("Failed to open file {}: {}", file_path.display(), e);
