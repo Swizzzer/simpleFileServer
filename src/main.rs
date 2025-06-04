@@ -19,6 +19,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::SystemTime,
 };
 use tokio::{
     fs::File,
@@ -61,11 +62,16 @@ struct FileEntry {
 struct DownloadQuery {
     download: Option<String>,
 }
+#[derive(Clone)]
+struct CachedFile {
+    data: Arc<Vec<u8>>,
+    modified: SystemTime,
+}
 
 #[derive(Clone)]
 struct AppState {
     root_dir: PathBuf,
-    file_cache: Cache<PathBuf, Arc<Vec<u8>>>,
+    file_cache: Cache<PathBuf, CachedFile>,
 }
 // 套娃，用于限速
 // 避免下行速率过高导致CPU满载
@@ -227,25 +233,38 @@ async fn handle_path_internal(
 
 async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, StatusCode> {
     let file_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
-
+    let file_modified = fs::metadata(&file_path)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     match file_size <= CACHE_FILE_SIZE_LIMIT && file_size > 0 {
         // 小文件缓存
         true => {
             // 缓存命中
-            if let Some(data) = state.file_cache.get(&file_path).await {
-                info!("Serving cached file: {}", file_path.display());
-                return Ok(small_file_response(&file_path, data.clone(), file_size));
+            if let Some(cached) = state.file_cache.get(&file_path).await {
+                if cached.modified == file_modified {
+                    info!("Serving cached file: {}", file_path.display());
+                    return Ok(small_file_response(
+                        &file_path,
+                        cached.data.clone(),
+                        file_size,
+                    ));
+                } else {
+                    info!(
+                        "File updated on disk, refreshing cache: {}",
+                        file_path.display()
+                    );
+                }
             }
-
             let data = tokio::fs::read(&file_path).await.map_err(|e| {
                 error!("Failed to read file {}: {}", file_path.display(), e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
             let arc_data = Arc::new(data);
-            state
-                .file_cache
-                .insert(file_path.clone(), arc_data.clone())
-                .await;
+            let cached = CachedFile {
+                data: arc_data.clone(),
+                modified: file_modified,
+            };
+            state.file_cache.insert(file_path.clone(), cached).await;
             info!("Small file cached: {}", file_path.display());
 
             Ok(small_file_response(&file_path, arc_data, file_size))
