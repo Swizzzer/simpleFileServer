@@ -7,7 +7,7 @@ use axum::{
 use colored::*;
 use std::{net::SocketAddr, time::Instant};
 use tracing_subscriber::{fmt, EnvFilter};
-
+use crate::Args;
 pub fn init() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -96,4 +96,45 @@ pub async fn logging(
     }
 
     response
+}
+pub fn banner(args: &Args, serve_dir: &std::path::Path) {
+    println!();
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════════".bright_blue()
+    );
+    println!(
+        "{} {}",
+        "🚀 Swizzer's HTTP File Server".bright_white().bold(),
+        "v0.1.0".bright_black()
+    );
+    println!(
+        "{}",
+        "═══════════════════════════════════════════════════════".bright_blue()
+    );
+    println!();
+    println!(
+        "{:<15} {}",
+        "Serving:".bright_white(),
+        serve_dir.display().to_string().cyan()
+    );
+    println!(
+        "{:<15} {}:{}",
+        "Binding:".bright_white(),
+        args.bind.yellow(),
+        args.port.to_string().yellow()
+    );
+    println!(
+        "{:<15} {}",
+        "Started at:".bright_white(),
+        time::OffsetDateTime::now_local()
+            .unwrap_or_else(|_| time::OffsetDateTime::now_utc())
+            .format(
+                &time::format_description::parse("[year]-[month]-[day] [hour]:[minute]:[second]")
+                    .unwrap()
+            )
+            .unwrap_or_else(|_| "Unknown".to_string())
+            .bright_green()
+    );
+    println!();
 }
