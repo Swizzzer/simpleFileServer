@@ -35,7 +35,7 @@ const CACHE_FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024; // 缓存文件大小限制4
 const CACHE_FILE_NUM_LIMIT: u64 = 128; // 最多缓存128个文件
 const RATE_LIMIT_BYTES_PER_SEC: usize = 100 * 1024 * 1024; // 限速100MB/s
 const STREAM_BUFFER_SIZE: usize = 512 * 1024; // 增大默认的Stream capacity, 减少异步任务调度数
-
+const CACHE_FILE_LIFETIME: u64 = 2 * 60 * 60; // 缓存文件2小时
 #[derive(Parser)]
 #[command(name = "http-file-server")]
 #[command(about = "A simple HTTP file server similar to `python -m http.server`")]
@@ -141,7 +141,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app_state = AppState {
         root_dir: serve_dir,
-        file_cache: Cache::builder().max_capacity(CACHE_FILE_NUM_LIMIT).build(),
+        file_cache: Cache::builder()
+            .max_capacity(CACHE_FILE_NUM_LIMIT)
+            .time_to_live(Duration::from_secs(CACHE_FILE_LIFETIME))
+            .build(),
     };
 
     let app = Router::new()
