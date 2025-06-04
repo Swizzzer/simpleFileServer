@@ -8,6 +8,7 @@ use axum::{
 };
 use clap::Parser;
 use colored::*;
+use futures::Stream;
 use moka::future::Cache;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
@@ -15,16 +16,23 @@ use std::{
     fs,
     net::SocketAddr,
     path::{Path as StdPath, PathBuf},
+    pin::Pin,
     sync::Arc,
+    task::{Context, Poll},
 };
-use tokio::fs::File;
+use tokio::{
+    fs::File,
+    time::{sleep, Duration, Instant},
+};
 use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 mod log;
 mod templates;
-const CACHE_FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024; // 4MB
+
+const CACHE_FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024; // 缓存文件大小限制4MB
 const CACHE_FILE_NUM_LIMIT: u64 = 128; // 最多缓存128个文件
+const RATE_LIMIT_BYTES_PER_SEC: usize = 10 * 1024 * 1024; // 限速10MB/s
 
 #[derive(Parser)]
 #[command(name = "http-file-server")]
@@ -57,6 +65,58 @@ struct DownloadQuery {
 struct AppState {
     root_dir: PathBuf,
     file_cache: Cache<PathBuf, Arc<Vec<u8>>>,
+}
+// 套娃，用于限速
+// 避免下行速率过高导致CPU满载
+struct RateLimitedStream<S> {
+    inner: S,
+    bytes_sent: usize,
+    window_start: Instant,
+}
+
+impl<S> RateLimitedStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            bytes_sent: 0,
+            window_start: Instant::now(),
+        }
+    }
+}
+
+impl<S> Stream for RateLimitedStream<S>
+where
+    S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let now = Instant::now();
+        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
+            self.bytes_sent = 0;
+            self.window_start = now;
+        }
+
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.bytes_sent += chunk.len();
+                if self.bytes_sent > RATE_LIMIT_BYTES_PER_SEC {
+                    // 超过速率，延迟到下一秒
+                    let delay = self.window_start + Duration::from_secs(1) - now;
+                    let waker = cx.waker().clone();
+                    let delay_fut = sleep(delay);
+                    tokio::spawn(async move {
+                        delay_fut.await;
+                        waker.wake();
+                    });
+                    Poll::Pending
+                } else {
+                    Poll::Ready(Some(Ok(chunk)))
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 #[tokio::main]
@@ -198,10 +258,11 @@ async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, St
             })?;
 
             let stream = ReaderStream::new(file);
-            let body = axum::body::Body::from_stream(stream);
-
+            // 看起来不是很优雅
+            // TODO: 重写一个支持限速的AsyncRead?
+            let stream_limited = RateLimitedStream::new(stream);
+            let body = axum::body::Body::from_stream(stream_limited);
             let headers = build_headers(&file_path, file_size);
-
             Ok((headers, body).into_response())
         }
     }

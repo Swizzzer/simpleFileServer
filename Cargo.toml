@@ -14,10 +14,11 @@ percent-encoding = "2.3"
 mime_guess = "2.0"
 anyhow = "1.0"
 clap = { version = "4.0", features = ["derive"] }
-# logs
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time", "local-time"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 colored = "2.0"
 tokio-util = "0.7.15"
 moka = { version = "0.12", features = ["future"] }
+futures = "0.3"
+bytes = "1.10.1"
