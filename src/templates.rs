@@ -2,6 +2,8 @@ use crate::FileEntry;
 
 pub fn generate_html(entries: &[FileEntry], current_path: &str) -> String {
     let entries_json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_string());
+    let current_path_json =
+        serde_json::to_string(current_path).unwrap_or_else(|_| "\"\"".to_string());
     let current_path_display = if current_path.is_empty() {
         "/"
     } else {
@@ -301,8 +303,8 @@ pub fn generate_html(entries: &[FileEntry], current_path: &str) -> String {
    </div>
    
    <script>
-       const entries = {};
-       const currentPath = '{}';
+       const entries = {entries_json};
+       const currentPath = {current_path_json};
        
        function formatFileSize(bytes) {{
            if (bytes === null || bytes === undefined) return '';
@@ -436,6 +438,8 @@ pub fn generate_html(entries: &[FileEntry], current_path: &str) -> String {
    </script>
 </body>
 </html>"#,
-        current_path_display, entries_json, current_path
+        current_path_display,
+        entries_json = entries_json,
+        current_path_json = current_path_json
     )
 }
