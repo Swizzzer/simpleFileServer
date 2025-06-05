@@ -280,7 +280,7 @@ async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, St
             })?;
             // 计算合适的缓冲区大小
             let buffer_size = match file_size {
-                4_194_308..=16_777_216 => 256 * 1024,  // 4MB~16MB: 256KB
+                4_194_305..=16_777_216 => 256 * 1024,  // 4MB~16MB: 256KB
                 16_777_217..=67_108_928 => 512 * 1024, // 16MB~64MB: 512KB
                 67_108_929..=1_073_741_824 => 1 * 1024 * 1024, // 64MB~1GB: 1MB
                 _ => 2 * 1024 * 1024,                  // >1GB: 2MB
