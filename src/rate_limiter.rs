@@ -100,37 +100,6 @@ impl RateLimiter {
         }
     }
 
-    /// 获取当前限速统计信息
-    pub fn stats(&self) -> RateLimiterStats {
-        let now = Instant::now();
-        let window_progress = now.duration_since(self.window_start).as_millis() as f64 / 1000.0;
-        let current_rate = if window_progress > 0.0 {
-            (self.bytes_consumed as f64 / window_progress) as usize
-        } else {
-            0
-        };
-
-        RateLimiterStats {
-            bytes_per_second: self.bytes_per_second,
-            bytes_consumed: self.bytes_consumed,
-            current_rate,
-            utilization: (self.bytes_consumed as f64 / self.bytes_per_second as f64 * 100.0) as u8,
-            burst_available: self.burst_buffer,
-        }
-    }
-
-    pub fn set_rate(&mut self, new_bytes_per_second: usize) {
-        if self.bytes_per_second > 0 {
-            let ratio = new_bytes_per_second as f64 / self.bytes_per_second as f64;
-            self.bytes_consumed = (self.bytes_consumed as f64 * ratio) as usize;
-        }
-        self.bytes_per_second = new_bytes_per_second;
-        
-        if self.burst_enabled {
-            self.burst_buffer = new_bytes_per_second / 5;
-        }
-    }
-
     fn should_reset_window(&self, now: Instant) -> bool {
         now.duration_since(self.window_start) >= Duration::from_secs(1)
     }
@@ -157,14 +126,6 @@ impl RateLimiter {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct RateLimiterStats {
-    pub bytes_per_second: usize,
-    pub bytes_consumed: usize,
-    pub current_rate: usize,
-    pub utilization: u8, // 0-100%
-    pub burst_available: usize,
-}
 
 pub struct RateLimitedStream<S> {
     inner: S,
@@ -185,18 +146,6 @@ impl<S> RateLimitedStream<S> {
             inner,
             rate_limiter: RateLimiter::with_burst(bytes_per_second, true, burst_size),
         }
-    }
-
-    pub fn rate_limiter(&self) -> &RateLimiter {
-        &self.rate_limiter
-    }
-
-    pub fn rate_limiter_mut(&mut self) -> &mut RateLimiter {
-        &mut self.rate_limiter
-    }
-
-    pub fn set_rate(&mut self, bytes_per_second: usize) {
-        self.rate_limiter.set_rate(bytes_per_second);
     }
 }
 
