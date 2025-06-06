@@ -14,6 +14,7 @@ use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
+    future::Future,
     net::SocketAddr,
     path::{Path as StdPath, PathBuf},
     pin::Pin,
@@ -23,7 +24,7 @@ use std::{
 };
 use tokio::{
     fs::File,
-    time::{sleep, Duration, Instant},
+    time::{Duration, Instant, Sleep},
 };
 use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
@@ -78,6 +79,7 @@ struct RateLimitedStream<S> {
     inner: S,
     bytes_sent: usize,
     window_start: Instant,
+    sleep: Option<Pin<Box<Sleep>>>,
 }
 
 impl<S> RateLimitedStream<S> {
@@ -86,6 +88,7 @@ impl<S> RateLimitedStream<S> {
             inner,
             bytes_sent: 0,
             window_start: Instant::now(),
+            sleep: None,
         }
     }
 }
@@ -103,18 +106,22 @@ where
             self.window_start = now;
         }
 
+        // 如果有sleep，优先等待
+        if let Some(ref mut sleep) = self.sleep {
+            match sleep.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(_) => self.sleep = None,
+            }
+        }
+
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.bytes_sent += chunk.len();
                 if self.bytes_sent > RATE_LIMIT_BYTES_PER_SEC {
                     // 超过速率，延迟到下一秒
                     let delay = self.window_start + Duration::from_secs(1) - now;
-                    let waker = cx.waker().clone();
-                    let delay_fut = sleep(delay);
-                    tokio::spawn(async move {
-                        delay_fut.await;
-                        waker.wake();
-                    });
+                    self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+                    cx.waker().wake_by_ref();
                     Poll::Pending
                 } else {
                     Poll::Ready(Some(Ok(chunk)))
