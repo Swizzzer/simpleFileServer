@@ -1,9 +1,9 @@
+use futures::{Future, Stream};
 use std::{
     pin::Pin,
     task::{Context, Poll},
     time::{Duration, Instant},
 };
-use futures::{Stream, Future};
 use tokio::time::Sleep;
 
 /// 统一的限速器实现
@@ -31,7 +31,7 @@ impl RateLimiter {
     }
 
     /// 支持突发的限速器
-    /// 
+    ///
     /// - `bytes_per_second`: 每秒允许的字节数
     /// - `burst_enabled`: 是否启用突发模式
     /// - `burst_size`: 突发缓冲区大小（通常设为 bytes_per_second 的 10-20%）
@@ -47,13 +47,13 @@ impl RateLimiter {
     }
 
     /// 检查是否可以继续发送数据
-    /// 
+    ///
     /// # 返回值
     /// - `Poll::Ready(())`: 可以继续发送
     /// - `Poll::Pending`: 需要等待，会在适当时机唤醒
     pub fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let now = Instant::now();
-        
+
         // 检查是否需要重置时间窗口
         if self.should_reset_window(now) {
             self.reset_window(now);
@@ -84,19 +84,19 @@ impl RateLimiter {
     }
 
     /// 消耗指定数量的字节配额
-    /// 
+    ///
     /// # 参数
     /// - `bytes`: 要消耗的字节数
     pub fn consume(&mut self, bytes: usize) {
         self.bytes_consumed += bytes;
-        
+
         // 如果启用突发模式，逐渐恢复突发缓冲区
         if self.burst_enabled && self.burst_buffer < self.bytes_per_second / 5 {
             let recovery_rate = self.bytes_per_second / 10; // 每秒恢复10%
             let elapsed = self.window_start.elapsed().as_millis() as usize;
             let recovery_amount = (recovery_rate * elapsed) / 1000;
-            self.burst_buffer = (self.burst_buffer + recovery_amount)
-                .min(self.bytes_per_second / 5);
+            self.burst_buffer =
+                (self.burst_buffer + recovery_amount).min(self.bytes_per_second / 5);
         }
     }
 
@@ -114,7 +114,6 @@ impl RateLimiter {
         // 计算到下一个时间窗口的剩余时间
         let window_end = self.window_start + Duration::from_secs(1);
         let remaining = window_end.saturating_duration_since(now);
-        
 
         let excess_ratio = self.bytes_consumed as f64 / self.bytes_per_second as f64;
         if excess_ratio > 2.0 {
@@ -125,7 +124,6 @@ impl RateLimiter {
         }
     }
 }
-
 
 pub struct RateLimitedStream<S> {
     inner: S,
@@ -169,7 +167,7 @@ where
         }
     }
 }
-#[derive(Debug, Clone)] 
+#[derive(Debug, Clone)]
 pub struct RateLimiterFactory {
     default_rate: usize,
     burst_enabled: bool,
