@@ -295,7 +295,7 @@ async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, St
 
             let stream = ReaderStream::with_capacity(file, buffer_size);
             // 看起来不是很优雅
-            // TODO: 重写一个支持限速的AsyncRead?
+            // 也不是不行
             let stream_limited = RateLimitedStream::new(stream);
             let body = axum::body::Body::from_stream(stream_limited);
             let headers = build_headers(&file_path, file_size);
