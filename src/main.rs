@@ -365,43 +365,44 @@ async fn serve_directory(
             error!("Failed to read directory {}: {}", dir_path.display(), e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            error!("Error reading directory entries: {}", e);
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
-
-    // 排序：目录在前，文件在后，按名称排序
-    dir_entries.sort_by(|a, b| {
-        let a_is_dir = a.path().is_dir();
-        let b_is_dir = b.path().is_dir();
-
-        match (a_is_dir, b_is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.file_name().cmp(&b.file_name()),
-        }
+        .map(|res| {
+            res.map_err(|e| {
+                error!("Failed to read entry: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })
+            .and_then(|entry| {
+                let file_name = entry.file_name();
+                let metadata = entry.metadata().map_err(|e| {
+                    error!("Failed to read metadata: {}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+                let is_dir = metadata.is_dir();
+                let size = if is_dir { None } else { Some(metadata.len()) };
+                Ok((file_name, is_dir, size))
+            })
+        })
+        .collect::<Result<Vec<_>, StatusCode>>()?;
+    
+    // (file_name, is_dir, size)
+    dir_entries.sort_by(|a, b| match (a.1, b.1) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.0.cmp(&b.0),
     });
 
-    for entry in dir_entries {
-        let file_name = entry.file_name().to_string_lossy().to_string();
-        let metadata = entry
-            .metadata()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        let is_dir = metadata.is_dir();
-
+    for (file_name, is_dir, size) in dir_entries {
+        let file_name_str = file_name.to_string_lossy().to_string();
         let entry_path = if current_path.is_empty() {
-            file_name.clone()
+            file_name_str.clone()
         } else {
-            format!("{}/{}", current_path.trim_end_matches('/'), file_name)
+            format!("{}/{}", current_path.trim_end_matches('/'), file_name_str)
         };
-
         let encoded_path = utf8_percent_encode(&entry_path, NON_ALPHANUMERIC).to_string();
 
         entries.push(FileEntry {
-            name: file_name,
+            name: file_name_str,
             is_dir,
-            size: if is_dir { None } else { Some(metadata.len()) },
+            size,
             url: format!("/{}", encoded_path),
         });
     }
