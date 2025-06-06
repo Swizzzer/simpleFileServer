@@ -106,7 +106,7 @@ pub fn banner(args: &Args, serve_dir: &std::path::Path) {
     println!(
         "{} {}",
         "🚀 Swizzer's HTTP File Server".bright_white().bold(),
-        "v0.2.0".bright_black()
+        "v0.2.1".bright_black()
     );
     println!(
         "{}",
