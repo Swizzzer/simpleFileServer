@@ -8,37 +8,35 @@ use axum::{
 };
 use clap::Parser;
 use colored::*;
-use futures::Stream;
 use moka::future::Cache;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    future::Future,
     net::SocketAddr,
     path::{Path as StdPath, PathBuf},
-    pin::Pin,
     sync::Arc,
-    task::{Context, Poll},
     time::SystemTime,
 };
-use tokio::{
-    fs::File,
-    time::{Duration, Instant, Sleep},
-};
+use tokio::{fs::File, time::Duration};
 use tokio_util::io::ReaderStream;
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 mod log;
+mod rate_limiter;
+mod sliding_window;
 mod templates;
+use rate_limiter::RateLimiterFactory;
 
 const CACHE_FILE_SIZE_LIMIT: u64 = 4 * 1024 * 1024; // 缓存文件大小限制4MB
 const CACHE_FILE_NUM_LIMIT: u64 = 128; // 最多缓存128个文件
 const RATE_LIMIT_BYTES_PER_SEC: usize = 100 * 1024 * 1024; // 限速100MB/s
 const CACHE_FILE_LIFETIME: Duration = Duration::from_secs(2 * 60 * 60); // 缓存文件2小时
+const SLIDING_WINDOW_THRESHOLD: u64 = 16 * 1024 * 1024; // 16MB以上的文件使用滑动窗口
+
 #[derive(Parser)]
 #[command(name = "http-file-server")]
-#[command(about = "A simple HTTP file server similar to `python -m http.server`")]
+#[command(about = "A simple HTTP file server with sliding window optimization")]
 struct Args {
     #[arg(short, long, default_value = "8000")]
     port: u16,
@@ -48,6 +46,9 @@ struct Args {
 
     #[arg(help = "Directory to serve (default: current directory)")]
     directory: Option<PathBuf>,
+
+    #[arg(long, help = "Disable sliding window optimization for large files")]
+    disable_sliding_window: bool,
 }
 
 #[derive(Serialize)]
@@ -62,6 +63,7 @@ struct FileEntry {
 struct DownloadQuery {
     download: Option<String>,
 }
+
 #[derive(Clone)]
 struct CachedFile {
     data: Arc<Vec<u8>>,
@@ -72,64 +74,8 @@ struct CachedFile {
 struct AppState {
     root_dir: PathBuf,
     file_cache: Cache<PathBuf, CachedFile>,
-}
-// 套娃，用于限速
-// 避免下行速率过高导致CPU满载
-struct RateLimitedStream<S> {
-    inner: S,
-    bytes_sent: usize,
-    window_start: Instant,
-    sleep: Option<Pin<Box<Sleep>>>,
-}
-
-impl<S> RateLimitedStream<S> {
-    fn new(inner: S) -> Self {
-        Self {
-            inner,
-            bytes_sent: 0,
-            window_start: Instant::now(),
-            sleep: None,
-        }
-    }
-}
-
-impl<S> Stream for RateLimitedStream<S>
-where
-    S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Unpin,
-{
-    type Item = Result<bytes::Bytes, std::io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let now = Instant::now();
-        if now.duration_since(self.window_start) >= Duration::from_secs(1) {
-            self.bytes_sent = 0;
-            self.window_start = now;
-        }
-
-        // 如果有sleep，优先等待
-        if let Some(ref mut sleep) = self.sleep {
-            match sleep.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(_) => self.sleep = None,
-            }
-        }
-
-        match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                self.bytes_sent += chunk.len();
-                if self.bytes_sent > RATE_LIMIT_BYTES_PER_SEC {
-                    // 超过速率，延迟到下一秒
-                    let delay = self.window_start + Duration::from_secs(1) - now;
-                    self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                } else {
-                    Poll::Ready(Some(Ok(chunk)))
-                }
-            }
-            other => other,
-        }
-    }
+    sliding_window_enabled: bool,
+    rate_limiter_factory: RateLimiterFactory,
 }
 
 #[tokio::main]
@@ -145,12 +91,25 @@ async fn main() -> anyhow::Result<()> {
 
     log::banner(&args, &serve_dir);
 
+    if !args.disable_sliding_window {
+        sliding_window::init_session_manager().await;
+        info!(
+            "Sliding window optimization enabled for files > {}MB",
+            SLIDING_WINDOW_THRESHOLD / 1024 / 1024
+        );
+    } else {
+        info!("Sliding window optimization disabled");
+    }
+
+    let rate_limiter_factory = RateLimiterFactory::new(RATE_LIMIT_BYTES_PER_SEC).with_burst(0.2); // 20%突发
     let app_state = AppState {
         root_dir: serve_dir,
         file_cache: Cache::builder()
             .max_capacity(CACHE_FILE_NUM_LIMIT)
             .time_to_live(CACHE_FILE_LIFETIME)
             .build(),
+        sliding_window_enabled: !args.disable_sliding_window,
+        rate_limiter_factory,
     };
 
     let app = Router::new()
@@ -163,10 +122,17 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", args.bind, args.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
+    let optimization_status = if args.disable_sliding_window {
+        "standard mode"
+    } else {
+        "with sliding window optimization"
+    };
+
     println!(
-        "{} Server ready at {}",
+        "{} Server ready at {} ({})",
         "✓".green(),
-        format!("http://{}", addr).bright_blue().underline()
+        format!("http://{}", addr).bright_blue().underline(),
+        optimization_status.cyan()
     );
     println!("{} Press Ctrl+C to stop", "ⓘ".blue());
     println!();
@@ -245,62 +211,140 @@ async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, St
     let file_modified = fs::metadata(&file_path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    match file_size <= CACHE_FILE_SIZE_LIMIT && file_size > 0 {
-        // 小文件缓存
-        true => {
-            // 缓存命中
-            if let Some(cached) = state.file_cache.get(&file_path).await {
-                if cached.modified == file_modified {
-                    info!("Serving cached file: {}", file_path.display());
-                    return Ok(small_file_response(
-                        &file_path,
-                        cached.data.clone(),
-                        file_size,
-                    ));
-                } else {
-                    info!(
-                        "File updated on disk, refreshing cache: {}",
-                        file_path.display()
-                    );
-                }
+
+    match file_size {
+        size if size <= CACHE_FILE_SIZE_LIMIT && size > 0 => {
+            info!(
+                "Serving small file (cached): {} ({} bytes)",
+                file_path.display(),
+                size
+            );
+            serve_small_file(file_path, state, file_size, file_modified).await
+        }
+        size if size <= SLIDING_WINDOW_THRESHOLD => {
+            info!(
+                "Serving medium file (streaming): {} ({} bytes)",
+                file_path.display(),
+                size
+            );
+            serve_medium_file(file_path, file_size, &state.rate_limiter_factory).await
+        }
+        size => {
+            if state.sliding_window_enabled {
+                info!(
+                    "Serving large file (sliding window): {} ({} bytes)",
+                    file_path.display(),
+                    size
+                );
+                serve_large_file_with_sliding_window(
+                    file_path,
+                    file_size,
+                    &state.rate_limiter_factory,
+                )
+                .await
+            } else {
+                info!(
+                    "Serving large file (streaming): {} ({} bytes)",
+                    file_path.display(),
+                    size
+                );
+                serve_medium_file(file_path, file_size, &state.rate_limiter_factory).await
             }
-            let data = tokio::fs::read(&file_path).await.map_err(|e| {
-                error!("Failed to read file {}: {}", file_path.display(), e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-            let arc_data = Arc::new(data);
-            let cached = CachedFile {
-                data: arc_data.clone(),
-                modified: file_modified,
-            };
-            state.file_cache.insert(file_path.clone(), cached).await;
-            info!("Small file cached: {}", file_path.display());
-
-            Ok(small_file_response(&file_path, arc_data, file_size))
         }
-        false => {
-            // 大文件流式传输
-            info!("Serving large file: {}", file_path.display());
-            let file = File::open(&file_path).await.map_err(|e| {
-                error!("Failed to open file {}: {}", file_path.display(), e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-            // 计算合适的缓冲区大小
-            let buffer_size = match file_size {
-                4_194_305..=16_777_216 => 256 * 1024,  // 4MB~16MB: 256KB
-                16_777_217..=67_108_928 => 512 * 1024, // 16MB~64MB: 512KB
-                67_108_929..=1_073_741_824 => 1 * 1024 * 1024, // 64MB~1GB: 1MB
-                _ => 2 * 1024 * 1024,                  // >1GB: 2MB
-            };
+    }
+}
 
-            let stream = ReaderStream::with_capacity(file, buffer_size);
-            // 看起来不是很优雅
-            // 也不是不行
-            let stream_limited = RateLimitedStream::new(stream);
-            let body = axum::body::Body::from_stream(stream_limited);
-            let headers = build_headers(&file_path, file_size);
-            Ok((headers, body).into_response())
+async fn serve_small_file(
+    file_path: PathBuf,
+    state: &AppState,
+    file_size: u64,
+    file_modified: SystemTime,
+) -> Result<Response, StatusCode> {
+    // 缓存命中
+    if let Some(cached) = state.file_cache.get(&file_path).await {
+        if cached.modified == file_modified {
+            info!("Cache hit for small file: {}", file_path.display());
+            return Ok(small_file_response(
+                &file_path,
+                cached.data.clone(),
+                file_size,
+            ));
+        } else {
+            info!("File updated, refreshing cache: {}", file_path.display());
         }
+    }
+    // 缓存未命中
+    let data = tokio::fs::read(&file_path).await.map_err(|e| {
+        error!("Failed to read file {}: {}", file_path.display(), e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let arc_data = Arc::new(data);
+    let cached = CachedFile {
+        data: arc_data.clone(),
+        modified: file_modified,
+    };
+    state.file_cache.insert(file_path.clone(), cached).await;
+    info!("Small file cached: {}", file_path.display());
+
+    Ok(small_file_response(&file_path, arc_data, file_size))
+}
+
+async fn serve_medium_file(
+    file_path: PathBuf,
+    file_size: u64,
+    rate_limiter_factory: &RateLimiterFactory,
+) -> Result<Response, StatusCode> {
+    let file = File::open(&file_path).await.map_err(|e| {
+        error!("Failed to open file {}: {}", file_path.display(), e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let buffer_size = calculate_buffer_size(file_size);
+    let stream = ReaderStream::with_capacity(file, buffer_size);
+    let stream_limited = rate_limiter_factory.create_stream(stream, None);
+    let body = axum::body::Body::from_stream(stream_limited);
+    let headers = build_headers(&file_path, file_size);
+    Ok((headers, body).into_response())
+}
+
+async fn serve_large_file_with_sliding_window(
+    file_path: PathBuf,
+    file_size: u64,
+    rate_limiter_factory: &RateLimiterFactory,
+) -> Result<Response, StatusCode> {
+    let buffer_size = calculate_buffer_size(file_size);
+
+    let rate_limiter = rate_limiter_factory.create_limiter(None);
+
+    let sliding_window_stream = sliding_window::SlidingWindowFileStream::new(
+        file_path.clone(),
+        buffer_size,
+        Some(rate_limiter),
+    )
+    .await
+    .map_err(|e| {
+        error!(
+            "Failed to create sliding window stream for {}: {}",
+            file_path.display(),
+            e
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let body = axum::body::Body::from_stream(sliding_window_stream);
+    let headers = build_headers(&file_path, file_size);
+    Ok((headers, body).into_response())
+}
+
+// 计算缓冲区大小
+fn calculate_buffer_size(file_size: u64) -> usize {
+    match file_size {
+        0..=4_194_304 => 64 * 1024,                     // 0-4MB: 64KB
+        4_194_305..=16_777_216 => 256 * 1024,           // 4MB-16MB: 256KB
+        16_777_217..=67_108_864 => 512 * 1024,          // 16MB-64MB: 512KB
+        67_108_865..=268_435_456 => 1024 * 1024,        // 64MB-256MB: 1MB
+        268_435_457..=1_073_741_824 => 2 * 1024 * 1024, // 256MB-1GB: 2MB
+        _ => 4 * 1024 * 1024,                           // >1GB: 4MB
     }
 }
 
@@ -319,6 +363,7 @@ fn build_headers(file_path: &PathBuf, file_size: u64) -> HeaderMap {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("download");
+
     headers.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
     headers.insert(
         header::CONTENT_LENGTH,
@@ -330,6 +375,13 @@ fn build_headers(file_path: &PathBuf, file_size: u64) -> HeaderMap {
             .parse()
             .unwrap(),
     );
+
+    // 添加缓存控制头
+    headers.insert(
+        header::CACHE_CONTROL,
+        "public, max-age=3600".parse().unwrap(),
+    );
+
     headers
 }
 
@@ -382,8 +434,8 @@ async fn serve_directory(
             })
         })
         .collect::<Result<Vec<_>, StatusCode>>()?;
-    
-    // (file_name, is_dir, size)
+
+    // 排序：目录优先，然后按名称排序
     dir_entries.sort_by(|a, b| match (a.1, b.1) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
