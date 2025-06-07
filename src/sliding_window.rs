@@ -26,22 +26,38 @@ use crate::rate_limiter::RateLimiter;
 const WINDOW_SIZE: usize = 8;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(30);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(300);
+const PREFETCH_SIZE: usize = 8; // 预读块数
+const MAX_PREFETCH_DISTANCE: u64 = 16; // 最大预读距离
 
 #[derive(Clone)]
 struct FileChunk {
     data: Arc<Bytes>,
     created_at: Instant,
+    is_prefetched: bool, // 是否为预读块
+}
+
+impl FileChunk {
+    fn new(data: Bytes, is_prefetched: bool) -> Self {
+        Self {
+            data: Arc::new(data),
+            created_at: Instant::now(),
+            is_prefetched,
+        }
+    }
 }
 
 struct SlidingWindow {
     chunks: Arc<DashMap<u64, FileChunk>>,
     window_start: AtomicU64,
     current_chunk: AtomicU64,
+    buffer_size: usize,
     last_access: AtomicU64,
+    prefetch_tracker: Arc<DashMap<u64, Instant>>,
+    access_pattern: Arc<Mutex<Vec<u64>>>,
 }
 
 impl SlidingWindow {
-    fn new() -> Self {
+    fn new(buffer_size: usize) -> Self {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -51,7 +67,10 @@ impl SlidingWindow {
             chunks: Arc::new(DashMap::new()),
             window_start: AtomicU64::new(0),
             current_chunk: AtomicU64::new(0),
+            buffer_size,
             last_access: AtomicU64::new(now),
+            prefetch_tracker: Arc::new(DashMap::new()),
+            access_pattern: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -62,17 +81,24 @@ impl SlidingWindow {
             .as_secs();
         self.last_access.store(now, Ordering::Relaxed);
 
+        if let Ok(mut pattern) = self.access_pattern.try_lock() {
+            pattern.push(chunk_index);
+            if pattern.len() > 20 {
+                pattern.remove(0);
+            }
+        }
+
         self.chunks
             .get(&chunk_index)
             .map(|entry| (*entry.data).clone())
     }
 
     fn add_chunk(&self, chunk_index: u64, data: Bytes) {
-        let chunk = FileChunk {
-            data: Arc::new(data),
-            created_at: Instant::now(),
-        };
+        self.add_chunk_internal(chunk_index, data, false);
+    }
 
+    fn add_chunk_internal(&self, chunk_index: u64, data: Bytes, is_prefetched: bool) {
+        let chunk = FileChunk::new(data, is_prefetched);
         self.chunks.insert(chunk_index, chunk);
         self.current_chunk.store(chunk_index, Ordering::Relaxed);
 
@@ -81,7 +107,7 @@ impl SlidingWindow {
             .unwrap()
             .as_secs();
         self.last_access.store(now, Ordering::Relaxed);
-        
+
         /// TODO: 更好的缓存清理策略
         /// 当下载速率足够高时，两个用户的请求要间隔非常接近才能利用上滑动窗口
         /// 间隔越大，用到的缓存越老，越快被清理
@@ -98,11 +124,117 @@ impl SlidingWindow {
         }
     }
 
+    fn trigger_prefetch(
+        &self,
+        current_chunk: u64,
+        manager: Arc<FileSessionManager>,
+        file_path: PathBuf,
+    ) {
+        if !self.should_prefetch(current_chunk) {
+            return;
+        }
+
+        let prefetch_start = current_chunk + 1;
+        let prefetch_chunks = self.calculate_prefetch_chunks();
+
+        let chunks_ref = self.chunks.clone();
+        let prefetch_tracker = self.prefetch_tracker.clone();
+        let buffer_size = self.buffer_size;
+
+        tokio::spawn(async move {
+            for i in 0..prefetch_chunks {
+                let chunk_idx = prefetch_start + i as u64;
+
+                if chunks_ref.contains_key(&chunk_idx) {
+                    continue;
+                }
+
+                if prefetch_tracker.contains_key(&chunk_idx) {
+                    continue;
+                }
+
+                prefetch_tracker.insert(chunk_idx, Instant::now());
+                if let Ok(data) = manager.read_chunk(&file_path, chunk_idx, buffer_size).await {
+                    let chunk = FileChunk::new(data, true); // 标记为预读块
+                    chunks_ref.insert(chunk_idx, chunk);
+                    debug!("Prefetched chunk {} for {:?}", chunk_idx, file_path);
+                }
+                prefetch_tracker.remove(&chunk_idx);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+    }
+
+    fn should_prefetch(&self, current_chunk: u64) -> bool {
+        if let Ok(pattern) = self.access_pattern.try_lock() {
+            if pattern.len() < 3 {
+                return true;
+            }
+
+            let recent_chunks = &pattern[pattern.len().saturating_sub(3)..];
+            let is_sequential = recent_chunks
+                .windows(2)
+                .all(|w| w[1] == w[0] + 1 || w[1] == w[0]);
+
+            if is_sequential {
+                return true;
+            }
+
+            let chunk_frequency = pattern
+                .iter()
+                .filter(|&&chunk| {
+                    chunk >= current_chunk.saturating_sub(5) && chunk <= current_chunk + 5
+                })
+                .count();
+
+            return chunk_frequency >= 2;
+        }
+
+        true // 默认预读
+    }
+
+    fn calculate_prefetch_chunks(&self) -> usize {
+        let cache_usage = self.chunks.len() as f64 / WINDOW_SIZE as f64;
+
+        if cache_usage > 0.8 {
+            std::cmp::max(1, PREFETCH_SIZE / 2)
+        } else if cache_usage < 0.3 {
+            std::cmp::min(PREFETCH_SIZE * 2, MAX_PREFETCH_DISTANCE as usize)
+        } else {
+            PREFETCH_SIZE
+        }
+    }
+
+    fn cleanup_prefetch_tracker(&self) {
+        let cutoff = Instant::now() - Duration::from_secs(30);
+        self.prefetch_tracker
+            .retain(|_, &mut timestamp| timestamp > cutoff);
+    }
+
     fn find_oldest_chunk(&self) -> Option<u64> {
-        self.chunks
-            .iter()
-            .min_by_key(|entry| entry.created_at)
-            .map(|entry| *entry.key())
+        let mut oldest_prefetch = None;
+        let mut oldest_normal = None;
+        let mut oldest_prefetch_time = Instant::now();
+        let mut oldest_normal_time = Instant::now();
+
+        for entry in self.chunks.iter() {
+            let chunk_id = *entry.key();
+            let chunk = entry.value();
+
+            if chunk.is_prefetched {
+                if oldest_prefetch.is_none() || chunk.created_at < oldest_prefetch_time {
+                    oldest_prefetch = Some(chunk_id);
+                    oldest_prefetch_time = chunk.created_at;
+                }
+            } else {
+                if oldest_normal.is_none() || chunk.created_at < oldest_normal_time {
+                    oldest_normal = Some(chunk_id);
+                    oldest_normal_time = chunk.created_at;
+                }
+            }
+        }
+
+        oldest_prefetch.or(oldest_normal)
     }
 
     fn is_expired(&self) -> bool {
@@ -113,6 +245,23 @@ impl SlidingWindow {
             .as_secs();
 
         now - last_access > SESSION_TIMEOUT.as_secs()
+    }
+
+    fn get_prefetch_stats(&self) -> (usize, usize, f64) {
+        let total_chunks = self.chunks.len();
+        let prefetch_chunks = self
+            .chunks
+            .iter()
+            .filter(|entry| entry.value().is_prefetched)
+            .count();
+
+        let hit_rate = if total_chunks > 0 {
+            (total_chunks - prefetch_chunks) as f64 / total_chunks as f64 * 100.0
+        } else {
+            0.0
+        };
+
+        (total_chunks, prefetch_chunks, hit_rate)
     }
 }
 
@@ -134,6 +283,7 @@ impl FileSessionManager {
     async fn get_or_create_session(
         &self,
         file_path: PathBuf,
+        buffer_size: usize,
     ) -> Result<Arc<SlidingWindow>, std::io::Error> {
         if let Ok(metadata) = tokio::fs::metadata(&file_path).await {
             let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
@@ -156,7 +306,7 @@ impl FileSessionManager {
         }
 
         let file = File::open(&file_path).await?;
-        let session = Arc::new(SlidingWindow::new());
+        let session = Arc::new(SlidingWindow::new(buffer_size));
         let reader = Arc::new(Mutex::new(file));
 
         self.sessions.insert(file_path.clone(), session.clone());
@@ -180,6 +330,10 @@ impl FileSessionManager {
             self.readers.remove(&file_path);
             self.file_metadata.remove(&file_path);
         }
+
+        for entry in self.sessions.iter() {
+            entry.value().cleanup_prefetch_tracker();
+        }
     }
 
     async fn read_chunk(
@@ -191,7 +345,7 @@ impl FileSessionManager {
         let reader = self.readers.get(file_path).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::NotFound, "File reader not found")
         })?;
-        // Question: 需要加锁吗？
+
         let mut file = reader.lock().await;
         let offset = chunk_index * buffer_size as u64;
 
@@ -264,7 +418,9 @@ impl SlidingWindowFileStream {
             std::io::Error::new(std::io::ErrorKind::Other, "Session manager not initialized")
         })?;
 
-        let session = manager.get_or_create_session(file_path.clone()).await?;
+        let session = manager
+            .get_or_create_session(file_path.clone(), buffer_size)
+            .await?;
 
         Ok(Self {
             file_path,
@@ -293,6 +449,9 @@ impl SlidingWindowFileStream {
 
         if let Some(data) = session.get_chunk(chunk_index) {
             debug!("Cache hit for chunk {} of {:?}", chunk_index, file_path);
+
+            session.trigger_prefetch(chunk_index, manager.clone(), file_path.clone());
+
             return Ok(Some(data));
         }
 
@@ -302,6 +461,7 @@ impl SlidingWindowFileStream {
             .await?;
 
         session.add_chunk(chunk_index, data.clone());
+        session.trigger_prefetch(chunk_index, manager, file_path);
 
         Ok(Some(data))
     }
@@ -322,7 +482,10 @@ impl Stream for SlidingWindowFileStream {
                 StreamState::Ready => {
                     let chunk_offset = self.current_chunk * self.buffer_size as u64;
                     if chunk_offset >= self.file_size {
-                        info!("Finished streaming file: {:?}", self.file_path);
+                        // 输出最终预读统计
+                        let (total, prefetched, hit_rate) = self.session.get_prefetch_stats();
+                        info!("Finished streaming file: {:?}, Cache stats: total={}, prefetched={}, hit_rate={:.1}%", 
+                              self.file_path, total, prefetched, hit_rate);
                         return Poll::Ready(None);
                     }
 
@@ -357,7 +520,9 @@ impl Stream for SlidingWindowFileStream {
                         return Poll::Ready(Some(Ok(data)));
                     }
                     Poll::Ready(Ok(None)) => {
-                        info!("Finished streaming file: {:?}", self.file_path);
+                        let (total, prefetched, hit_rate) = self.session.get_prefetch_stats();
+                        info!("Finished streaming file: {:?}, Final cache stats: total={}, prefetched={}, hit_rate={:.1}%", 
+                                  self.file_path, total, prefetched, hit_rate);
                         self.state = StreamState::Ready;
                         return Poll::Ready(None);
                     }
