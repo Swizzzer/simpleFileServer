@@ -108,10 +108,10 @@ impl SlidingWindow {
             .as_secs();
         self.last_access.store(now, Ordering::Relaxed);
 
-        /// TODO: 更好的缓存清理策略
-        /// 当下载速率足够高时，两个用户的请求要间隔非常接近才能利用上滑动窗口
-        /// 间隔越大，用到的缓存越老，越快被清理
-        /// 我，真是个笨蛋.jpg
+        // TODO: 更好的缓存清理策略
+        // 当下载速率足够高时，两个用户的请求要间隔非常接近才能利用上滑动窗口
+        // 间隔越大，用到的缓存越老，越快被清理
+        // 我，真是个笨蛋.jpg
         if self.chunks.len() > WINDOW_SIZE {
             if let Some(oldest_index) = self.find_oldest_chunk() {
                 self.chunks.remove(&oldest_index);
