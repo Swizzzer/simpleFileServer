@@ -240,6 +240,8 @@ async fn handle_path_internal(
     Err(StatusCode::NOT_FOUND)
 }
 
+// TODO: 如果用户一开始指定的就是serve单个文件(比如，分享某个大文件)，为这单个文件提供内存缓存，减少IO瓶颈
+
 async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, StatusCode> {
     let file_size = fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
     let file_modified = fs::metadata(&file_path)
@@ -294,8 +296,6 @@ async fn serve_file(file_path: PathBuf, state: &AppState) -> Result<Response, St
             };
 
             let stream = ReaderStream::with_capacity(file, buffer_size);
-            // 看起来不是很优雅
-            // 也不是不行
             let stream_limited = RateLimitedStream::new(stream);
             let body = axum::body::Body::from_stream(stream_limited);
             let headers = build_headers(&file_path, file_size);
